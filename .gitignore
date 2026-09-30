@@ -1,0 +1,17 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+
+# Prepared datasets and generated checkpoints
+data/*
+!data/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
