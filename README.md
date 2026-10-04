@@ -9,7 +9,10 @@ follow. See [AGENTS.MD](AGENTS.MD) for the implementation requirements.
 Raw dataset loading, character tokenisation, token tensors, a sequential 90/10
 split, next-character batches, and token/positional embeddings are implemented.
 The complete single causal attention head is also implemented, from Q/K/V
-projections through weighted Value mixing.
+projections through weighted Value mixing. Multi-head attention combines independent
+heads, projects their outputs back to the embedding size, and applies dropout.
+The position-wise feed-forward network and complete pre-normalised
+`TransformerBlock` are also implemented.
 The full language model, training loop, and generation
 are not implemented yet. The dataset and trained checkpoints
 are not tracked in version control.
@@ -23,11 +26,11 @@ are not tracked in version control.
 ├── requirements.txt
 ├── data/                 # Put the corpus in input.txt
 ├── dataset.py            # Text loading, tokenisation, tensors, and batches
-├── model.py              # Configuration, embeddings, and a complete attention head
+├── model.py              # Configuration, embeddings, and Transformer blocks
 ├── train.py              # Training entry-point placeholder
 ├── generate.py           # Generation entry-point placeholder
 ├── checkpoints/          # Saved model weights and vocabulary
-└── tests/                # Dataset and tokenizer checks
+└── tests/                # Dataset, tokenizer, and model component checks
 ```
 
 ## Setup
@@ -186,13 +189,120 @@ enables it again. New modules start in training mode.
 receives a weighted sum of visible Values, producing shape `(B, T, head_size)`.
 Calling `output = head(vectors)` runs all seven stages through `forward()`.
 Separate calls in training mode can differ because dropout samples a fresh mask;
-use `head.eval()` to compare outputs. Next comes multi-head attention.
+use `head.eval()` to compare outputs.
 
 Run the small numerical example, which prints scores of 2 and 7 for the first
 Query:
 
 ```bash
 python -m pytest tests/test_attention.py -v -s
+```
+
+## Multi-head attention
+
+`MultiHeadAttention` gives the same input to several independent `AttentionHead`
+instances. Each head has its own learned Q/K/V projections. Their outputs are
+concatenated along the feature dimension, then a learned linear projection mixes
+those features within each token. Output dropout follows the projection.
+
+Continuing the embeddings example:
+
+```python
+from model import MultiHeadAttention
+
+attention = MultiHeadAttention(model)
+attention.eval()  # Disable dropout in all heads and at the output for inspection.
+output = attention(vectors)
+print(output.shape)  # torch.Size([32, 128, 128]): B, T, C
+```
+
+Calling `attention(vectors)` runs its `forward()`, which calls each head's existing
+`forward()`. With `n_embd=128` and `n_head=4`, each head returns 32 features per
+token; concatenating four heads restores 128. Input and output both have shape
+`(B, T, C)`, ready for a later residual connection. The output projection does
+not mix sequence positions, so causal visibility is preserved.
+
+Use `attention.train()` to enable dropout again. These weights are still randomly
+initialised; they have not learned language patterns.
+
+Run the multi-head checks:
+
+```bash
+python -m unittest discover -s tests -p 'test_multihead_attention.py' -v
+```
+
+## Feed-forward network
+
+`FeedForward` processes each token independently, using the same learned layers
+at every position. Attention gathers information from visible tokens; the
+feed-forward network processes the resulting features within each token.
+
+The calculation is `Linear(C, 4*C) → GELU → Linear(4*C, C) → Dropout`.
+With the default configuration, features expand from 128 to 512 and return to
+128. GELU adds a nonlinear transformation so the network can learn more than a
+single linear mapping. Input and output both have shape `(B, T, C)`.
+
+Continuing the multi-head example:
+
+```python
+from model import FeedForward
+
+feed_forward = FeedForward(model)
+feed_forward.eval()  # Disable dropout for inspection.
+processed = feed_forward(output)
+print(processed.shape)  # torch.Size([32, 128, 128]): B, T, C
+```
+
+Calling `feed_forward(output)` runs its `forward()`. Changing one input token's
+vector cannot affect another position's output. Call `feed_forward.train()` to
+enable dropout during training. This example demonstrates the components;
+`TransformerBlock` combines them with layer normalisation and residual connections.
+
+Run the feed-forward checks:
+
+```bash
+python -m unittest discover -s tests -p 'test_feedforward.py' -v
+```
+
+## Transformer block
+
+`TransformerBlock` combines the existing components in this order:
+
+```python
+x = x + self_attention(layer_norm_1(x))
+x = x + feed_forward(layer_norm_2(x))
+```
+
+Each LayerNorm normalises the features within one token and has its own learned
+scale and bias. Normalisation happens before each branch (pre-normalisation).
+Each residual addition keeps the incoming representation and adds the branch's
+learned update, providing a direct path for both features and gradients.
+All stages preserve shape `(B, T, C)`. Normalisation and feed-forward processing
+do not mix token positions, so the attention mask preserves causality throughout
+the block, including when multiple blocks are stacked.
+
+Continuing the embeddings example, pass the original embedding vectors to the
+block; it runs both attention and feed-forward processing internally:
+
+```python
+from model import TransformerBlock
+
+block = TransformerBlock(model)
+block.eval()  # Disable dropout throughout the block for inspection.
+refined = block(vectors)
+print(refined.shape)  # torch.Size([32, 128, 128]): B, T, C
+```
+
+Use `block.train()` to enable dropout for training. A block returns refined token
+features, not vocabulary predictions. The next class, `ShakespeareTransformer`,
+will combine embeddings, a stack of blocks, final normalisation, and a vocabulary
+output layer. The `n_layer` setting will control that stack; a `TransformerBlock`
+instance always represents one block.
+
+Run the block checks:
+
+```bash
+python -m unittest discover -s tests -p 'test_transformer_block.py' -v
 ```
 
 ## Tests and experiments
@@ -252,7 +362,7 @@ Generated Shakespeare
 ```
 
 Causal attention lets each character use only its preceding context and itself.
-Each block will use pre-normalisation, residual connections, explicit multi-head
+Each block uses pre-normalisation, residual connections, explicit multi-head
 scaled dot-product attention, and a GELU feed-forward network. The output logits
 will have shape `(B, T, V)`: batch size, sequence length, vocabulary size.
 Cross-entropy will train the model to predict the next character.
@@ -304,9 +414,14 @@ reload these values and sample one character at a time from the most recent
 2. Token and positional embeddings are implemented and tested, including
    gradient flow to both tables. The complete `AttentionHead` is tested for
    weighted Value mixing, output shape, gradients, and causality.
-   Next implement `MultiHeadAttention`, `FeedForward`,
-   `TransformerBlock`, and `ShakespeareTransformer` incrementally; check CPU
-   execution, tensor shapes, and causal masking as each component is added.
+   `MultiHeadAttention` is implemented and tested for head combination, output
+   projection, dropout, gradients, CPU shapes, and causality.
+   `FeedForward` is implemented and tested for the GELU calculation, shapes,
+   position independence, gradients, and dropout.
+   `TransformerBlock` is implemented and tested for pre-normalisation, residual
+   connections, gradients, CPU shapes, and causality through stacked blocks.
+   Next implement `ShakespeareTransformer` with final normalisation and
+   vocabulary logits, then verify shapes and causal masking end to end.
 3. Implement AdamW training and validation; verify decreasing loss on a small
    sample before attempting a full training run.
 4. Implement checkpoint saving/loading and temperature-based generation;

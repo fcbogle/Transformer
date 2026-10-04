@@ -1,7 +1,6 @@
-"""Embeddings and the first attention calculations for a small Transformer.
+"""Embeddings, causal attention, and blocks for a small Transformer.
 
-Next implement MultiHeadAttention, FeedForward,
-TransformerBlock, and ShakespeareTransformer.
+Next implement ShakespeareTransformer.
 
 Tensor notation: B = batch size, T = sequence length, C = embedding dimension,
 V = vocabulary size, H = number of attention heads.
@@ -173,3 +172,66 @@ class AttentionHead(nn.Module):
         weights = self.attention_weights(masked_scores)
         dropped_weights = self.apply_dropout(weights)
         return self.combine_values(dropped_weights, value)
+
+
+class MultiHeadAttention(nn.Module):
+    """Run independent causal heads, then learn how to mix their outputs."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        # ModuleList registers every head's parameters for training and saving.
+        self.heads = nn.ModuleList(
+            AttentionHead(config) for _ in range(config.n_head)
+        )
+        self.projection = nn.Linear(config.n_embd, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Map (B, T, C) to (B, T, C), preserving causal visibility."""
+        # Each head receives the same input and returns (B, T, C / H).
+        head_outputs = [head(x) for head in self.heads]
+        combined = torch.cat(head_outputs, dim=-1)  # (B, T, C)
+        # Mix features within each token; do not mix sequence positions here.
+        projected = self.projection(combined)  # (B, T, C)
+        return self.dropout(projected)
+
+
+class FeedForward(nn.Module):
+    """Process each token independently with shared learned feature transforms."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.expand = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.activation = nn.GELU()
+        self.project = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Map (B, T, C) to (B, T, C) without mixing token positions."""
+        if x.ndim != 3 or x.shape[-1] != self.expand.in_features:
+            raise ValueError("x must have shape (B, T, n_embd)")
+        expanded = self.expand(x)  # (B, T, 4 * C)
+        activated = self.activation(expanded)  # Nonlinear feature processing.
+        projected = self.project(activated)  # (B, T, C)
+        return self.dropout(projected)
+
+
+class TransformerBlock(nn.Module):
+    """A pre-normalised causal attention and feed-forward block."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        # Each LayerNorm normalises features within one token, never across time.
+        self.layer_norm_1 = nn.LayerNorm(config.n_embd)
+        self.self_attention = MultiHeadAttention(config)
+        self.layer_norm_2 = nn.LayerNorm(config.n_embd)
+        self.feed_forward = FeedForward(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Refine token features (B, T, C), preserving shape and causality."""
+        if x.ndim != 3 or x.shape[-1] != self.layer_norm_1.normalized_shape[0]:
+            raise ValueError("x must have shape (B, T, n_embd)")
+        # Residual additions preserve a direct path for features and gradients.
+        x = x + self.self_attention(self.layer_norm_1(x))  # (B, T, C)
+        x = x + self.feed_forward(self.layer_norm_2(x))  # (B, T, C)
+        return x
