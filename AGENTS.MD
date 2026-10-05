@@ -1,5 +1,10 @@
 # AGENTS.md
 
+## Editor preference
+
+The user uses **VS Code**, not PyCharm. Use VS Code for editor, debugger,
+breakpoint, and environment setup instructions.
+
 ## Project Purpose
 
 Build a small, educational **decoder-only Transformer language model in PyTorch** and train it on Shakespeare text.

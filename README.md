@@ -6,6 +6,10 @@ follow. See [AGENTS.MD](AGENTS.MD) for the implementation requirements.
 
 ## Current status
 
+For a worked example of every stage and a CPU script with optional breakpoints,
+see [MODEL_WALKTHROUGH.md](MODEL_WALKTHROUGH.md). Run
+`python debug_walkthrough.py --step` to inspect the implemented stages interactively.
+
 Raw dataset loading, character tokenisation, token tensors, a sequential 90/10
 split, next-character batches, and token/positional embeddings are implemented.
 The complete single causal attention head is also implemented, from Q/K/V
