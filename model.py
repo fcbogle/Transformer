@@ -1,10 +1,8 @@
-"""Embeddings, causal attention, and blocks for a small Transformer.
-
-Next implement ShakespeareTransformer.
+"""A small decoder-only Transformer built from explicit PyTorch components.
 
 Tensor notation: B = batch size, T = sequence length, C = embedding dimension,
 V = vocabulary size, H = number of attention heads.
-The model will map token IDs (B, T) to vocabulary logits (B, T, V).
+The model maps token IDs (B, T) to vocabulary logits (B, T, V).
 """
 
 from dataclasses import dataclass
@@ -12,6 +10,7 @@ from math import sqrt
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 @dataclass
@@ -39,7 +38,7 @@ class TokenAndPositionEmbeddings(nn.Module):
     """Convert character IDs into learned token-plus-position vectors.
 
     Both tables start with random values and are updated during training.
-    This is the input component of the future Transformer, not a language model.
+    This component supplies the language model's initial token features.
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -235,3 +234,46 @@ class TransformerBlock(nn.Module):
         x = x + self.self_attention(self.layer_norm_1(x))  # (B, T, C)
         x = x + self.feed_forward(self.layer_norm_2(x))  # (B, T, C)
         return x
+
+
+class ShakespeareTransformer(nn.Module):
+    """Predict the next character at every position using only its causal context."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.embeddings = TokenAndPositionEmbeddings(config)
+        # Each block has independent weights; n_layer controls model depth.
+        self.blocks = nn.Sequential(
+            *(TransformerBlock(config) for _ in range(config.n_layer))
+        )
+        self.final_norm = nn.LayerNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+
+    def forward(
+        self, token_ids: torch.Tensor, targets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return logits (B, T, V) and optional scalar next-character loss.
+
+        targets must contain the next character's ID for each input position,
+        already shifted by the batch loader. Without targets, loss is None.
+        """
+        if targets is not None:
+            if targets.shape != token_ids.shape:
+                raise ValueError("targets must have the same shape (B, T) as token_ids")
+            if targets.dtype != torch.long:
+                raise ValueError("targets must contain torch.long integer IDs")
+
+        x = self.embeddings(token_ids)  # (B, T) → (B, T, C)
+        x = self.blocks(x)  # (B, T, C)
+        x = self.final_norm(x)  # (B, T, C)
+        logits = self.lm_head(x)  # (B, T, V): raw scores, not probabilities.
+
+        loss = None
+        if targets is not None:
+            # Treat all B × T positions as examples; cross-entropy applies
+            # log-softmax internally, so feed it logits directly.
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]), targets.reshape(-1)
+            )
+        return logits, loss

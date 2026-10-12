@@ -17,8 +17,10 @@ projections through weighted Value mixing. Multi-head attention combines indepen
 heads, projects their outputs back to the embedding size, and applies dropout.
 The position-wise feed-forward network and complete pre-normalised
 `TransformerBlock` are also implemented.
-The full language model, training loop, and generation
-are not implemented yet. The dataset and trained checkpoints
+`ShakespeareTransformer` now combines embeddings, a configurable stack of blocks,
+final LayerNorm, and a vocabulary head, with optional next-character loss.
+AdamW training, validation, terminal/CSV monitoring, checkpoint saving/loading,
+and temperature-based generation are implemented. The dataset and trained checkpoints
 are not tracked in version control.
 
 ## Project layout
@@ -31,8 +33,8 @@ are not tracked in version control.
 ├── data/                 # Put the corpus in input.txt
 ├── dataset.py            # Text loading, tokenisation, tensors, and batches
 ├── model.py              # Configuration, embeddings, and Transformer blocks
-├── train.py              # Training entry-point placeholder
-├── generate.py           # Generation entry-point placeholder
+├── train.py              # Training, validation, loss logging, and checkpoints
+├── generate.py           # Load a checkpoint and sample characters
 ├── checkpoints/          # Saved model weights and vocabulary
 └── tests/                # Dataset, tokenizer, and model component checks
 ```
@@ -127,7 +129,7 @@ selects where to put the returned batch.
 `TokenAndPositionEmbeddings` in `model.py` is a PyTorch `nn.Module` containing
 two learnable lookup tables. The token table has shape `(vocab_size, n_embd)`;
 the position table has shape `(block_size, n_embd)`. They are randomly initialised
-and will learn their values when training is implemented.
+and learn their values during training.
 
 Continuing the batch example above:
 
@@ -298,15 +300,56 @@ print(refined.shape)  # torch.Size([32, 128, 128]): B, T, C
 ```
 
 Use `block.train()` to enable dropout for training. A block returns refined token
-features, not vocabulary predictions. The next class, `ShakespeareTransformer`,
-will combine embeddings, a stack of blocks, final normalisation, and a vocabulary
-output layer. The `n_layer` setting will control that stack; a `TransformerBlock`
+features, not vocabulary predictions. `ShakespeareTransformer`
+combines embeddings, a stack of blocks, final normalisation, and a vocabulary
+output layer. The `n_layer` setting controls that stack; a `TransformerBlock`
 instance always represents one block.
 
 Run the block checks:
 
 ```bash
 python -m unittest discover -s tests -p 'test_transformer_block.py' -v
+```
+
+## Complete language model
+
+`ShakespeareTransformer` maps character IDs `(B, T)` to vocabulary logits
+`(B, T, V)`. Each position predicts the character that follows it, using only
+the current and earlier input characters. The final LayerNorm normalises each
+token's features, and the linear language model head maps those features to
+one score for every vocabulary character.
+
+```python
+import torch
+from dataset import CharacterTokenizer, encode_text, get_batch
+from model import ModelConfig, ShakespeareTransformer
+
+tokenizer = CharacterTokenizer("To be or " * 20)
+tokens = encode_text("To be or " * 20, tokenizer)
+x, y = get_batch(tokens, batch_size=1, block_size=8)
+config = ModelConfig(vocab_size=tokenizer.vocab_size, block_size=8,
+                     n_embd=8, n_head=2, n_layer=2)
+language_model = ShakespeareTransformer(config)
+logits, loss = language_model(x, y)
+print(logits.shape)  # torch.Size([1, 8, 6]): B, T, V
+print(loss.item())   # Scalar cross-entropy against shifted targets y.
+loss.backward()     # Gradients reach embeddings and every Transformer block.
+
+language_model.eval()
+with torch.no_grad():
+    logits, loss = language_model(x)  # Without targets, loss is None.
+    probabilities = torch.softmax(logits[:, -1, :], dim=-1)
+```
+
+The model returns `(logits, loss)` in both cases. Pass raw logits directly to
+cross-entropy; it performs log-softmax internally. Apply softmax when you want
+probabilities for inspection or sampling. These predictions are untrained until
+an optimiser updates the model weights.
+
+Run the language model checks:
+
+```bash
+python -m unittest discover -s tests -p 'test_language_model.py' -v
 ```
 
 ## Tests and experiments
@@ -392,24 +435,55 @@ Defaults live in `ModelConfig` in `model.py` and `TrainingConfig` in `train.py`.
 
 ## Training and generation
 
-Once implemented, the entry points will be:
+With `data/input.txt` prepared, run in the VS Code terminal with `.venv` active:
 
 ```bash
 python train.py
 python generate.py
 ```
 
-Currently these commands exit with an explanatory scaffold message. Training
-will select CUDA, then Apple Metal (MPS), then CPU according to availability,
-report training and validation loss, save a checkpoint, and generate a sample.
-CPU will support small correctness checks; full training may take substantially
-longer than on a GPU. Runtime will depend on hardware and configuration, and
-useful text will require training beyond a brief smoke test.
+Training selects CUDA, then Apple Metal (MPS), then CPU according to availability.
+It prints the device, parameter count, and run directory, then evaluates an
+untrained baseline. It reports training/validation loss after each evaluation
+interval and at the final step. For a smaller first experiment with frequent
+updates, use:
 
-Checkpoints will contain `model_state_dict`, `config`, `stoi`, and `itos`, under
-`checkpoints/`, without silently overwriting unrelated files. Generation will
-reload these values and sample one character at a time from the most recent
-`block_size` tokens, with configurable temperature.
+```bash
+python train.py --max-steps 1000 --batch-size 16 --block-size 64 --n-embd 64 --n-head 4 --n-layer 2 --eval-interval 50 --eval-iters 10
+```
+
+Loss should trend downward over many evaluations; individual readings fluctuate
+because evaluation samples random batches. Validation loss measures prediction on
+the held-out final 10% of the corpus. If training loss keeps falling while
+validation loss rises persistently, the model may be overfitting.
+
+Each run creates a fresh `checkpoints/run-.../` directory. Its `losses.csv` records
+step, training loss, validation loss, and elapsed seconds; open it in VS Code or
+a spreadsheet to compare readings or chart both losses against step. The file
+is flushed after each evaluation. Use a smaller `--eval-interval` for more frequent
+updates and a smaller `--eval-iters` to spend less time evaluating.
+
+`model.pt` is saved after evaluations and when training exits. Press **Ctrl+C**
+once to stop and save current weights. Checkpoints contain `model_state_dict`,
+`config`, `stoi`, `itos`, optimiser state, training settings, and completed step.
+The CLI starts a new training run; resuming optimiser state is not implemented.
+
+`python generate.py` loads the most recently saved checkpoint under `checkpoints/`.
+Choose a particular run, prompt, and sampling temperature with:
+
+```bash
+python generate.py --checkpoint checkpoints/run-YOUR_RUN/model.pt --prompt "ROMEO:" --max-new-tokens 500 --temperature 0.8
+```
+
+Generation appends the requested number of characters to the prompt, using only
+the most recent `block_size` tokens. Lower temperatures favour likely characters;
+higher temperatures increase variety. Prompts must use characters in the corpus.
+Training prints a short generated sample at the end; early samples will be noisy.
+
+CPU supports training and small correctness checks, but full training can take
+substantially longer than on a GPU. Runtime depends on hardware and configuration.
+Use `--device cpu` to force CPU, and `python train.py --help` for all settings.
+Useful Shakespeare-like text requires more learning than a brief smoke test.
 
 ## Implementation milestones
 
@@ -424,10 +498,11 @@ reload these values and sample one character at a time from the most recent
    position independence, gradients, and dropout.
    `TransformerBlock` is implemented and tested for pre-normalisation, residual
    connections, gradients, CPU shapes, and causality through stacked blocks.
-   Next implement `ShakespeareTransformer` with final normalisation and
-   vocabulary logits, then verify shapes and causal masking end to end.
-3. Implement AdamW training and validation; verify decreasing loss on a small
-   sample before attempting a full training run.
-4. Implement checkpoint saving/loading and temperature-based generation;
-   verify checkpoint round-tripping and generated length.
-5. Train on Shakespeare and inspect samples for improvement.
+   `ShakespeareTransformer` adds final normalisation and vocabulary logits,
+   tested for shapes and causal masking end to end.
+3. AdamW training and validation are implemented, with tests for decreasing
+   training and validation loss on a small repeated text sample.
+4. Checkpoint saving/loading and temperature-based generation are implemented,
+   with tests for checkpoint round-tripping and generated length.
+5. A full Shakespeare training run and qualitative sample comparison remain
+   experiments for the learner; short correctness checks do not establish text quality.
